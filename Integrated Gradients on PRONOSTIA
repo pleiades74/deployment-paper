@@ -1,0 +1,98 @@
+# ============================================================
+# K3: Integrated Gradients on PRONOSTIA (complete)
+# ============================================================
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import json
+import os
+
+N_BG, N_EXPLAIN, STEPS = 80, 15, 8
+
+baseline_vib = np.mean(X_pr_test[:N_BG], axis=0, keepdims=True)
+baseline_ews = np.mean(X_pr_ews_scaled[:N_BG], axis=0, keepdims=True)
+explain_vib = X_pr_test[N_BG:N_BG+N_EXPLAIN]
+explain_ews = X_pr_ews_scaled[N_BG:N_BG+N_EXPLAIN]
+
+@tf.function(reduce_retracing=True)
+def rul_score(v, e):
+    p = model([v, e], training=False)
+    return tf.reshape(p['pronostia_rul'], [-1])
+
+def integrated_gradients(model, vib, ews, bv, be, fn, steps=8):
+    alphas = np.linspace(0, 1, steps + 1)[1:]
+    ig_vib = np.zeros_like(vib, dtype=np.float32)
+    ig_ews = np.zeros_like(ews, dtype=np.float32)
+    for a in alphas:
+        iv = bv + a * (vib - bv)
+        ie = be + a * (ews - be)
+        with tf.GradientTape() as tape:
+            v = tf.convert_to_tensor(iv, tf.float32)
+            e = tf.convert_to_tensor(ie, tf.float32)
+            tape.watch([v, e])
+            score = fn(v, e)
+        gv, ge = tape.gradient(score, [v, e])
+        ig_vib += gv.numpy()
+        ig_ews += ge.numpy()
+    ig_vib /= steps
+    ig_ews /= steps
+    ig_vib *= (vib - bv)
+    ig_ews *= (ews - be)
+    return ig_vib, ig_ews
+
+all_v, all_e = [], []
+for i in range(N_EXPLAIN):
+    gv, ge = integrated_gradients(model, explain_vib[i:i+1], explain_ews[i:i+1],
+                                   baseline_vib, baseline_ews, rul_score, STEPS)
+    all_v.append(gv)
+    all_e.append(ge)
+
+ig_vib = np.vstack(all_v)
+ig_ews = np.vstack(all_e)
+
+# ---- Report ----
+ews_names = ['RMS','Peak','Crest','Std','Skew','Kurt','P2P','Shape','Impulse','Clearance','Autocorr']
+ch_names = ['Vib-H','Vib-V','Pad-1','Pad-2']
+ews_imp = np.mean(np.abs(ig_ews), axis=(0,1)) if ig_ews.ndim == 3 else np.mean(np.abs(ig_ews), axis=0)
+vib_imp = np.mean(np.abs(ig_vib), axis=(0,1))
+
+print("\n📊 Pronostia EWS importance (top-5):")
+for i in np.argsort(ews_imp)[::-1][:5]:
+    print(f"   {ews_names[i]:12s}: {ews_imp[i]:.6f}")
+
+print("\n📊 Pronostia channel importance:")
+for i in np.argsort(vib_imp)[::-1]:
+    print(f"   {ch_names[i]:12s}: {vib_imp[i]:.6f}")
+
+# ---- Save ----
+out_dir = "/kaggle/working/ig_pronostia"
+os.makedirs(out_dir, exist_ok=True)
+
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.bar(range(11), ews_imp, color='steelblue', edgecolor='black')
+ax.set_xticks(range(11))
+ax.set_xticklabels(ews_names, rotation=45, ha='right')
+ax.set_ylabel('Mean |IG|', fontweight='bold')
+ax.set_title('EWS importance (Pronostia RUL)', fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(out_dir, 'ig_ews_importance.png'), dpi=300)
+plt.savefig(os.path.join(out_dir, 'ig_ews_importance.pdf'))
+plt.close()
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.bar(ch_names, vib_imp, color='darkorange', edgecolor='black')
+ax.set_ylabel('Mean |IG|', fontweight='bold')
+ax.set_title('Channel importance (Pronostia)', fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(out_dir, 'ig_channel_importance.png'), dpi=300)
+plt.savefig(os.path.join(out_dir, 'ig_channel_importance.pdf'))
+plt.close()
+
+with open(os.path.join(out_dir, 'ig_summary.json'), 'w') as f:
+    json.dump({
+        'ews_importance': {n: float(v) for n, v in zip(ews_names, ews_imp)},
+        'channel_importance': {n: float(v) for n, v in zip(ch_names, vib_imp)},
+        'n_explained': N_EXPLAIN,
+        'n_background': N_BG,
+    }, f, indent=2)
+
+print(f"\n✅ Saved to {out_dir}")
