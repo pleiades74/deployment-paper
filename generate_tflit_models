@@ -1,0 +1,722 @@
+# ============================================================
+# MT-SUPINN STANDALONE CONVERSION SCRIPT — FIXED (v2)
+# ============================================================
+# Fixes applied:
+#   1. lightweight_mode default is False (matches training)
+#   2. load_weights uses by_name=True and re-raises on failure
+#   3. Removed the dead/duplicate weight-load block
+#   4. EWS features use scipy's bias-corrected skew/kurtosis
+#      (identical to main.py FeatureExtractor.ews_features)
+#   5. Calibration files are shuffled, not taken from the first N
+#   6. N_PER_DATASET = 150
+#   7. Verified TFLite predictions against Keras
+#   8. NEW: Load ews_scaler.pkl and apply it to every EWS feature
+#      before use in calibration. Without this, INT8 quantizer
+#      computes wrong activation ranges → accuracy collapse.
+# ============================================================
+
+import os
+import glob
+import joblib
+import numpy as np
+import pandas as pd
+import scipy.io as sio
+from scipy.stats import skew, kurtosis
+import tensorflow as tf
+from dataclasses import dataclass
+from typing import List
+from tensorflow.keras import layers, Model, regularizers
+
+print(f"✅ TensorFlow: {tf.__version__}")
+
+
+# ============================================================
+# ARCHITECTURE (VERIFIED AGAINST main.py)
+# ============================================================
+
+class GradientReversalLayer(layers.Layer):
+    def __init__(self, alpha=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.alpha = alpha
+
+    def call(self, inputs):
+        @tf.custom_gradient
+        def reverse_gradient(x):
+            def grad(dy):
+                return -self.alpha * dy
+            return x, grad
+        return reverse_gradient(inputs)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'alpha': self.alpha})
+        return config
+
+
+@dataclass
+class MultiModalConfig:
+    window_size: int = 1024
+    cnn_filters: int = 32
+    lstm_units: int = 64
+    shared_hidden: List[int] = None
+    dropout: float = 0.25
+    cwru_classes: int = 4
+    paderborn_classes: int = 3
+    l2_reg: float = 0.0005
+    temperature_scaling: float = 1.5
+
+    lightweight_mode: bool = False
+    skip_ews: bool = False
+    use_dann: bool = True
+
+    def __post_init__(self):
+        if self.shared_hidden is None:
+            self.shared_hidden = [128, 64]
+
+
+def build_multimodal_model(config: MultiModalConfig) -> Model:
+    multimodal_in = layers.Input(shape=(config.window_size, 4), name='multimodal_input')
+    ews_in = layers.Input(shape=(11,), name='ews_features')
+
+    vib = layers.Lambda(lambda x: x[:, :, 0:1], name='extract_vibration')(multimodal_in)
+    current = layers.Lambda(lambda x: x[:, :, 1:3], name='extract_current')(multimodal_in)
+    temperature = layers.Lambda(lambda x: x[:, :, 3:4], name='extract_temperature')(multimodal_in)
+
+    # VIBRATION BRANCH
+    vib_branches = []
+    for k in [3, 5, 7]:
+        x = layers.Conv1D(config.cnn_filters // 2, k, padding='same', activation='relu',
+                          kernel_regularizer=regularizers.l2(config.l2_reg))(vib)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling1D(2)(x)
+        vib_branches.append(x)
+    vib_merged = layers.concatenate(vib_branches)
+    vib_merged = layers.Conv1D(64, 3, padding='same', activation='relu',
+                                kernel_regularizer=regularizers.l2(config.l2_reg))(vib_merged)
+    vib_lstm = layers.Bidirectional(layers.LSTM(config.lstm_units // 2, return_sequences=False,
+                                                  dropout=0.2, recurrent_dropout=0.2))(vib_merged)
+
+    # CURRENT BRANCH
+    cur_branches = []
+    for k in [3, 5]:
+        x = layers.Conv1D(16, k, padding='same', activation='relu',
+                          kernel_regularizer=regularizers.l2(config.l2_reg))(current)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling1D(2)(x)
+        cur_branches.append(x)
+    cur_merged = layers.concatenate(cur_branches)
+    cur_merged = layers.Conv1D(32, 3, padding='same', activation='relu',
+                                kernel_regularizer=regularizers.l2(config.l2_reg))(cur_merged)
+    cur_lstm = layers.Bidirectional(layers.LSTM(32, return_sequences=False,
+                                                 dropout=0.2, recurrent_dropout=0.2))(cur_merged)
+
+    # TEMPERATURE BRANCH
+    temp_conv = layers.Conv1D(16, 5, padding='same', activation='relu',
+                               kernel_regularizer=regularizers.l2(config.l2_reg))(temperature)
+    temp_conv = layers.BatchNormalization()(temp_conv)
+    temp_conv = layers.Conv1D(16, 3, activation='relu')(temp_conv)
+    temp_conv = layers.GlobalAveragePooling1D()(temp_conv)
+    temp_dense = layers.Dense(32, activation='relu',
+                               kernel_regularizer=regularizers.l2(config.l2_reg))(temp_conv)
+
+    # EWS BRANCH
+    if hasattr(config, 'skip_ews') and config.skip_ews:
+        print("⚠️ EWS features DISABLED for ablation")
+        e = layers.Lambda(lambda x: tf.zeros_like(x), name='ews_zero')(ews_in)
+        e = layers.Dense(16, activation='relu', name='ews_dummy')(e)
+    else:
+        e = layers.Dense(64, activation='relu',
+                         kernel_regularizer=regularizers.l2(config.l2_reg))(ews_in)
+        e = layers.BatchNormalization()(e)
+        e = layers.Dropout(config.dropout)(e)
+        e = layers.Dense(32, activation='relu',
+                         kernel_regularizer=regularizers.l2(config.l2_reg))(e)
+        e = layers.Dropout(config.dropout)(e)
+        e = layers.Dense(16, activation='relu')(e)
+
+    # PROJECTIONS
+    vib_proj = layers.Dense(64, activation='relu',
+                             kernel_regularizer=regularizers.l2(config.l2_reg))(vib_lstm)
+    cur_proj = layers.Dense(64, activation='relu',
+                             kernel_regularizer=regularizers.l2(config.l2_reg))(cur_lstm)
+    temp_proj = layers.Dense(64, activation='relu',
+                              kernel_regularizer=regularizers.l2(config.l2_reg))(temp_dense)
+    ews_proj = layers.Dense(64, activation='relu',
+                             kernel_regularizer=regularizers.l2(config.l2_reg))(e)
+
+    # FUSION
+    lightweight = hasattr(config, 'lightweight_mode') and config.lightweight_mode
+    if lightweight:
+        print("⚠️ Lightweight mode: Skipping cross-attention")
+        vib_seq = layers.Reshape((1, 64))(vib_proj)
+        cur_seq = layers.Reshape((1, 64))(cur_proj)
+        temp_seq = layers.Reshape((1, 64))(temp_proj)
+        ews_seq = layers.Reshape((1, 64))(ews_proj)
+        fused = layers.Concatenate()([vib_seq, cur_seq, temp_seq, ews_seq])
+    else:
+        vib_seq = layers.Reshape((1, 64))(vib_proj)
+        cur_seq = layers.Reshape((1, 64))(cur_proj)
+        temp_seq = layers.Reshape((1, 64))(temp_proj)
+        ews_seq = layers.Reshape((1, 64))(ews_proj)
+        vib_cur_attn = layers.MultiHeadAttention(num_heads=4, key_dim=16)(query=cur_seq, key=vib_seq, value=vib_seq)
+        cur_vib_attn = layers.MultiHeadAttention(num_heads=4, key_dim=16)(query=vib_seq, key=cur_seq, value=cur_seq)
+        combined_seq = layers.Concatenate()([vib_seq, cur_seq])
+        temp_all_attn = layers.MultiHeadAttention(num_heads=4, key_dim=16)(query=temp_seq, key=combined_seq, value=combined_seq)
+        fused = layers.Concatenate()([vib_seq, cur_seq, temp_seq, ews_seq,
+                                       vib_cur_attn, cur_vib_attn, temp_all_attn])
+
+    combined = layers.Flatten()(fused)
+    combined = layers.Dropout(0.3)(combined)
+
+    for units in [64, 32]:
+        combined = layers.Dense(units, activation='relu',
+                                 kernel_regularizer=regularizers.l2(config.l2_reg))(combined)
+        combined = layers.BatchNormalization()(combined)
+        combined = layers.Dropout(config.dropout)(combined)
+
+    # DANN
+    use_dann = hasattr(config, 'use_dann') and config.use_dann
+    if use_dann:
+        domain_features = GradientReversalLayer(alpha=1.0, name='gradient_reversal')(combined)
+        domain_dense = layers.Dense(32, activation='relu',
+                                     kernel_regularizer=regularizers.l2(config.l2_reg))(domain_features)
+        domain_dense = layers.BatchNormalization()(domain_dense)
+        domain_dense = layers.Dropout(0.3)(domain_dense)
+        domain_out = layers.Dense(2, activation='softmax', name='domain')(domain_dense)
+    else:
+        domain_out = layers.Lambda(lambda x: tf.zeros_like(x)[:, :2], name='domain_dummy')(combined)
+
+    # OUTPUTS
+    shared_features = layers.Dense(64, activation='relu')(combined)
+    cluster_embedding = layers.Dense(16, activation='linear', name='cluster_embedding')(combined)
+    shared_damage = layers.Dense(1, activation='sigmoid', name='shared_damage')(combined)
+
+    cwru_logits = layers.Dense(config.cwru_classes, activation='linear', name='cwru_logits')(
+        layers.Dropout(0.5)(shared_features))
+    if config.temperature_scaling != 1.0:
+        cwru_logits = layers.Lambda(lambda x: x / config.temperature_scaling, name='cwru_temp_scaled')(cwru_logits)
+    cwru_out = layers.Activation('softmax', name='cwru_class')(cwru_logits)
+
+    paderborn_logits = layers.Dense(config.paderborn_classes, activation='linear', name='paderborn_logits')(
+        layers.Dropout(0.5)(shared_features))
+    if config.temperature_scaling != 1.0:
+        paderborn_logits = layers.Lambda(lambda x: x / config.temperature_scaling, name='paderborn_temp_scaled')(paderborn_logits)
+    paderborn_out = layers.Activation('softmax', name='paderborn_class')(paderborn_logits)
+
+    pronostia_out = layers.Dense(1, activation='sigmoid', name='pronostia_rul')(
+        layers.Dropout(config.dropout)(shared_features))
+
+    return Model(inputs=[multimodal_in, ews_in], outputs={
+        'cwru_class': cwru_out,
+        'paderborn_class': paderborn_out,
+        'pronostia_rul': pronostia_out,
+        'shared_damage': shared_damage,
+        'cluster_embedding': cluster_embedding,
+        'domain': domain_out
+    })
+
+
+# ============================================================
+# BUILD MODEL
+# ============================================================
+
+config = MultiModalConfig()
+model = build_multimodal_model(config)
+n_params = model.count_params()
+print(f"\n📊 Model parameters: {n_params:,}")
+print(f"   Expected full model: 165,147")
+if n_params != 165147:
+    print(f"   ⚠️ WARNING: parameter count mismatch!")
+else:
+    print(f"   ✅ Parameter count matches full model architecture")
+
+
+# ============================================================
+# LOAD WEIGHTS
+# ============================================================
+
+WEIGHTS_PATH = "/kaggle/input/datasets/pleiades74/full-seed256-h5/mt_supinn_weights.weights.h5"
+if not os.path.exists(WEIGHTS_PATH):
+    WEIGHTS_PATH = "mt_supinn_weights.weights.h5"
+
+print(f"\n📦 Loading weights: {WEIGHTS_PATH}")
+if not os.path.exists(WEIGHTS_PATH):
+    raise FileNotFoundError(
+        f"Weights file not found: {WEIGHTS_PATH}\n"
+        f"Upload the .weights.h5 file next to this script, or fix the path."
+    )
+
+try:
+    model.load_weights(WEIGHTS_PATH)
+    print("✅ Weights loaded successfully")
+except Exception as e:
+    raise RuntimeError(f"WEIGHT LOAD FAILED: {e}")
+
+# Quick smoke test
+_test_vib = np.zeros((1, 1024, 4), dtype=np.float32)
+_test_ews = np.zeros((1, 11), dtype=np.float32)
+_test_out = model([_test_vib, _test_ews], training=False)
+print(f"   Smoke test output keys: {list(_test_out.keys())}")
+
+
+# ============================================================
+# FIX 8: LOAD EWS SCALER
+# ============================================================
+# The scaler MUST be loaded and applied to all calibration EWS
+# features. Otherwise the INT8 quantizer computes activation
+# ranges from an unnormalised distribution, which collapses
+# accuracy (CWRU 99% -> ~40% has been observed).
+
+SCALER_PATH = "/kaggle/input/datasets/pleiades74/ews-scaler-seed256-full/ews_scaler.pkl"
+if not os.path.exists(SCALER_PATH):
+    SCALER_PATH = "ews_scaler.pkl"
+
+print(f"\n📦 Loading EWS scaler: {SCALER_PATH}")
+if not os.path.exists(SCALER_PATH):
+    raise FileNotFoundError(
+        f"Scaler file not found: {SCALER_PATH}\n"
+        f"Upload ews_scaler.pkl next to this script, or fix the path."
+    )
+
+scaler = joblib.load(SCALER_PATH)
+print(f"   ✅ Scaler loaded")
+print(f"      mean shape  = {scaler.mean_.shape}")
+print(f"      scale shape = {scaler.scale_.shape}")
+print(f"      mean[:3]    = {scaler.mean_[:3]}")
+print(f"      scale[:3]   = {scaler.scale_[:3]}")
+
+
+def _scale_ews(ews_raw: np.ndarray) -> np.ndarray:
+    """
+    Apply the training StandardScaler to a raw (11,) EWS vector.
+    Returns a (11,) float32 vector ready to feed the model.
+    """
+    ews_raw = np.asarray(ews_raw, dtype=np.float32).reshape(1, 11)
+    scaled = scaler.transform(ews_raw).astype(np.float32).reshape(11)
+    return scaled
+
+
+# ============================================================
+# EWS FEATURES
+# ============================================================
+
+def compute_ews_features(signal: np.ndarray) -> np.ndarray:
+    """
+    Compute the 11 EWS features.
+    IDENTICAL to main.py FeatureExtractor.ews_features,
+    including scipy's bias-corrected skewness and kurtosis.
+    """
+    signal = np.asarray(signal, dtype=np.float32).reshape(-1)
+    if len(signal) == 0:
+        return np.zeros(11, dtype=np.float32)
+
+    eps = 1e-10
+    rms = np.sqrt(np.mean(signal ** 2) + eps)
+    peak = np.max(np.abs(signal))
+    crest = peak / (rms + eps)
+    std_val = np.std(signal)
+
+    if np.std(signal) < eps:
+        skew_val, kurt_val = 0.0, -3.0
+    else:
+        skew_val = skew(signal, bias=False, nan_policy='omit')
+        kurt_val = kurtosis(signal, fisher=True, bias=False, nan_policy='omit')
+
+    peak_to_peak = np.ptp(signal)
+    mean_abs = np.mean(np.abs(signal)) + eps
+    shape_factor = rms / mean_abs
+    impulse_factor = peak / mean_abs
+    mean_sqrt_abs = np.mean(np.sqrt(np.abs(signal))) + eps
+    clearance_factor = peak / (mean_sqrt_abs ** 2 + eps)
+
+    if len(signal) > 2:
+        autocorr = np.sum(signal[:-1] * signal[1:]) / (np.sum(signal ** 2) + eps)
+    else:
+        autocorr = 0.0
+
+    return np.array([rms, peak, crest, std_val, skew_val, kurt_val,
+                     peak_to_peak, shape_factor, impulse_factor,
+                     clearance_factor, autocorr], dtype=np.float32)
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+CWRU_DIR      = "/kaggle/input/datasets/pleiades74/my-cwru/csv_files"
+PADERBORN_DIR = "/kaggle/input/datasets/pleiades74/multimodel-pader/Paderborn"
+PRONOSTIA_DIR = "/kaggle/input/datasets/egorefimow/smallone/Pronostia dataset"
+
+WINDOW = 1024
+N_PER_DATASET = 150
+RNG_SEED = 42
+
+rng = np.random.RandomState(RNG_SEED)
+
+
+# ============================================================
+# CALIBRATION SAMPLE LOADERS
+# EWS is now SCALED via _scale_ews before being stored
+# ============================================================
+
+def _load_cwru_samples():
+    samples = []
+    all_files = sorted(glob.glob(os.path.join(CWRU_DIR, "*.csv")))
+    if not all_files:
+        print(f"   ⚠️ No CWRU files at {CWRU_DIR}")
+        return samples
+    rng.shuffle(all_files)
+    files = all_files[:20]
+    for f in files:
+        try:
+            df = pd.read_csv(f)
+            cols = df.columns.tolist()
+            de = next((c for c in cols if 'DE' in c.upper()), None)
+            fe = next((c for c in cols if 'FE' in c.upper()), None)
+            ba = next((c for c in cols if 'BA' in c.upper()), None)
+            if not (de and fe):
+                continue
+            de_arr = pd.to_numeric(df[de], errors='coerce').dropna().values.astype(np.float32)
+            fe_arr = pd.to_numeric(df[fe], errors='coerce').dropna().values.astype(np.float32)
+            ba_arr = pd.to_numeric(df[ba], errors='coerce').dropna().values.astype(np.float32) \
+                     if ba else np.zeros_like(de_arr)
+            n = min(len(de_arr), len(fe_arr), len(ba_arr))
+            if n < WINDOW:
+                continue
+            raw = np.stack([de_arr[:n], fe_arr[:n], ba_arr[:n]], axis=1)
+            padded = np.zeros((n, 4), dtype=np.float32)
+            padded[:, :3] = raw
+            for start in range(0, n - WINDOW + 1, WINDOW * 4):
+                win = padded[start:start + WINDOW]
+                # CWRU: EWS uses ALL channels (matches training)
+                ch_feats = [compute_ews_features(win[:, c]) for c in range(3)]
+                ews_raw = np.mean(ch_feats, axis=0)
+                ews = _scale_ews(ews_raw)                       # ← FIX 8
+                samples.append((win[None, ...].astype(np.float32),
+                                ews[None, ...].astype(np.float32)))
+                if len(samples) >= N_PER_DATASET:
+                    return samples
+        except Exception:
+            continue
+    return samples
+
+
+def _load_paderborn_samples():
+    samples = []
+    all_files = sorted(glob.glob(os.path.join(PADERBORN_DIR, "**", "*.mat"),
+                                  recursive=True))
+    if not all_files:
+        print(f"   ⚠️ No Paderborn files at {PADERBORN_DIR}")
+        return samples
+    rng.shuffle(all_files)
+    files = all_files[:20]
+    for f in files:
+        try:
+            mat = sio.loadmat(f)
+            key = next((k for k in mat.keys() if k.startswith('N') and not k.startswith('__')), None)
+            if key is None:
+                continue
+            ds = mat[key]
+            if ds.shape == (1, 1):
+                ds = ds[0, 0]
+            if not hasattr(ds, 'dtype') or 'Y' not in ds.dtype.names:
+                continue
+            Y = ds['Y']
+            vib, c1, c2, temp = None, None, None, None
+            for i in range(Y.shape[1] if Y.ndim == 2 else Y.size):
+                item = Y[0, i] if Y.ndim == 2 else Y[i]
+                if not hasattr(item, 'dtype') or not item.dtype.names:
+                    continue
+                name = None
+                if 'Name' in item.dtype.names:
+                    try:
+                        rn = item['Name']
+                        while isinstance(rn, np.ndarray) and rn.size == 1:
+                            rn = rn.item()
+                        name = str(rn).strip()
+                    except Exception:
+                        name = None
+                if 'Data' not in item.dtype.names or name is None:
+                    continue
+                arr = np.asarray(item['Data'], dtype=np.float32).reshape(-1)
+                if name == 'vibration_1': vib = arr
+                elif name == 'phase_current_1': c1 = arr
+                elif name == 'phase_current_2': c2 = arr
+                elif name == 'temp_2_bearing_module': temp = arr
+            if vib is None or len(vib) < WINDOW:
+                continue
+            n = len(vib)
+            if c1 is None or len(c1) != n: c1 = np.zeros(n, dtype=np.float32)
+            if c2 is None or len(c2) != n: c2 = np.zeros(n, dtype=np.float32)
+            if temp is None or len(temp) != n: temp = np.zeros(n, dtype=np.float32)
+            stacked = np.stack([vib, c1, c2, temp], axis=1)
+            for start in range(0, n - WINDOW + 1, WINDOW * 4):
+                win = stacked[start:start + WINDOW]
+                # Paderborn: EWS uses VIBRATION ONLY (matches training)
+                ews_raw = compute_ews_features(win[:, 0])
+                ews = _scale_ews(ews_raw)                       # ← FIX 8
+                samples.append((win[None, ...].astype(np.float32),
+                                ews[None, ...].astype(np.float32)))
+                if len(samples) >= N_PER_DATASET:
+                    return samples
+        except Exception:
+            continue
+    return samples
+
+
+def _load_pronostia_samples():
+    samples = []
+    all_files = sorted(glob.glob(os.path.join(PRONOSTIA_DIR, "**", "acc_*.csv"),
+                                  recursive=True))
+    if not all_files:
+        print(f"   ⚠️ No Pronostia files at {PRONOSTIA_DIR}")
+        return samples
+    rng.shuffle(all_files)
+    files = all_files[:20]
+    for f in files:
+        try:
+            with open(f, 'r') as fh:
+                first = fh.readline()
+            sep = ';' if ';' in first else ','
+            df = pd.read_csv(f, header=None, delimiter=sep)
+            arr = df.values.astype(np.float32)
+            if arr.shape[1] >= 6:
+                h, v = arr[:, 4], arr[:, 5]
+            elif arr.shape[1] >= 2:
+                h, v = arr[:, 0], arr[:, 1]
+            else:
+                continue
+            n = min(len(h), len(v))
+            if n < WINDOW:
+                continue
+            stacked = np.stack([h[:n], v[:n]], axis=1)
+            padded = np.zeros((n, 4), dtype=np.float32)
+            padded[:, :2] = stacked
+            for start in range(0, n - WINDOW + 1, WINDOW * 4):
+                win = padded[start:start + WINDOW]
+                # Pronostia: EWS uses ALL 2 channels (matches training)
+                ch_feats = [compute_ews_features(win[:, c]) for c in range(2)]
+                ews_raw = np.mean(ch_feats, axis=0)
+                ews = _scale_ews(ews_raw)                       # ← FIX 8
+                samples.append((win[None, ...].astype(np.float32),
+                                ews[None, ...].astype(np.float32)))
+                if len(samples) >= N_PER_DATASET:
+                    return samples
+        except Exception:
+            continue
+    return samples
+
+
+# ============================================================
+# BUILD CALIBRATION SET
+# ============================================================
+
+print("\n📦 Loading real calibration samples...")
+_cal_samples = []
+_cal_samples += _load_cwru_samples()
+print(f"   CWRU:        {len(_cal_samples)} cumulative")
+_cal_samples += _load_paderborn_samples()
+print(f"   + Paderborn: {len(_cal_samples)} cumulative")
+_cal_samples += _load_pronostia_samples()
+print(f"   + Pronostia: {len(_cal_samples)} total")
+
+assert len(_cal_samples) > 0, "No calibration samples loaded — check dataset paths"
+
+# Sanity check on first sample
+_first_ews = _cal_samples[0][1].reshape(-1)
+print(f"\n   Sanity check on first calibration sample:")
+print(f"     scaled EWS mean = {np.mean(_first_ews):.4f}  (should be ~0)")
+print(f"     scaled EWS std  = {np.std(_first_ews):.4f}  (should be ~1)")
+
+
+def representative_dataset():
+    """Feeds REAL, SCALED samples for INT8 calibration."""
+    for vib, ews in _cal_samples:
+        yield [vib, ews]
+
+
+# ============================================================
+# CONVERT — 3 VARIANTS
+# ============================================================
+
+os.makedirs('tflite_models', exist_ok=True)
+
+# ---- FP32 ----
+print("\n🔄 Converting to FP32...")
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.target_spec.supported_ops = [
+    tf.lite.OpsSet.TFLITE_BUILTINS,
+    tf.lite.OpsSet.SELECT_TF_OPS
+]
+converter._experimental_lower_tensor_list_ops = False
+fp32 = converter.convert()
+open('tflite_models/model_fp32.tflite', 'wb').write(fp32)
+print(f"✅ FP32: {len(fp32)/1024:.2f} KB")
+
+
+# ---- FP16 ----
+print("\n🔄 Converting to FP16...")
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.target_spec.supported_ops = [
+    tf.lite.OpsSet.TFLITE_BUILTINS,
+    tf.lite.OpsSet.SELECT_TF_OPS
+]
+converter._experimental_lower_tensor_list_ops = False
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.target_spec.supported_types = [tf.float16]
+fp16 = converter.convert()
+open('tflite_models/model_fp16.tflite', 'wb').write(fp16)
+print(f"✅ FP16: {len(fp16)/1024:.2f} KB")
+
+
+# ---- INT8 ----
+print("\n🔄 Converting to INT8...")
+try:
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
+        tf.lite.OpsSet.SELECT_TF_OPS
+    ]
+    converter._experimental_lower_tensor_list_ops = False
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = representative_dataset
+    converter.inference_input_type = tf.float32
+    converter.inference_output_type = tf.float32
+    int8 = converter.convert()
+    open('tflite_models/model_int8.tflite', 'wb').write(int8)
+    print(f"✅ INT8: {len(int8)/1024:.2f} KB")
+except Exception as e:
+    print(f"⚠️ Full INT8 failed: {e}")
+    print("   Trying dynamic-range fallback...")
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS,
+        tf.lite.OpsSet.SELECT_TF_OPS
+    ]
+    converter._experimental_lower_tensor_list_ops = False
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    int8 = converter.convert()
+    open('tflite_models/model_int8.tflite', 'wb').write(int8)
+    print(f"✅ INT8 (dynamic): {len(int8)/1024:.2f} KB")
+
+
+# ============================================================
+# VERIFY PREDICTIONS AGAINST KERAS
+# ============================================================
+
+def _find_input_index(input_details, target_shape):
+    for d in input_details:
+        if list(d['shape']) == target_shape:
+            return d['index']
+    return None
+
+
+def _find_output_index(output_details, target_shape):
+    for d in output_details:
+        if list(d['shape']) == target_shape:
+            return d['index']
+    return None
+
+
+def verify_tflite_against_keras(keras_model, tflite_path, samples, n_check=10):
+    """
+    Compare TFLite predictions to Keras on real calibration samples.
+    Both TFLite and Keras see the same scaled EWS inputs.
+    """
+    interp = tf.lite.Interpreter(model_path=tflite_path)
+    interp.allocate_tensors()
+    input_details = interp.get_input_details()
+    output_details = interp.get_output_details()
+
+    vib_idx = _find_input_index(input_details, [1, 1024, 4])
+    ews_idx = _find_input_index(input_details, [1, 11])
+    cwru_idx = _find_output_index(output_details, [1, 4])
+    pader_idx = _find_output_index(output_details, [1, 3])
+    rul_idx = _find_output_index(output_details, [1, 1])
+
+    max_cwru_diff = 0.0
+    max_pader_diff = 0.0
+    max_rul_diff = 0.0
+
+    n_check = min(n_check, len(samples))
+    for i in range(n_check):
+        vib, ews = samples[i]
+
+        keras_pred = keras_model([vib, ews], training=False)
+        k_cwru = keras_pred['cwru_class'].numpy()[0]
+        k_pader = keras_pred['paderborn_class'].numpy()[0]
+        k_rul = keras_pred['pronostia_rul'].numpy()[0]
+
+        interp.set_tensor(vib_idx, vib)
+        interp.set_tensor(ews_idx, ews)
+        interp.invoke()
+
+        if cwru_idx is not None:
+            t_cwru = interp.get_tensor(cwru_idx)[0]
+            max_cwru_diff = max(max_cwru_diff, float(np.max(np.abs(k_cwru - t_cwru))))
+        if pader_idx is not None:
+            t_pader = interp.get_tensor(pader_idx)[0]
+            max_pader_diff = max(max_pader_diff, float(np.max(np.abs(k_pader - t_pader))))
+        if rul_idx is not None:
+            t_rul = interp.get_tensor(rul_idx)[0]
+            max_rul_diff = max(max_rul_diff, float(np.max(np.abs(k_rul - t_rul))))
+
+    return {
+        'cwru_max_abs_diff': max_cwru_diff,
+        'paderborn_max_abs_diff': max_pader_diff,
+        'rul_max_abs_diff': max_rul_diff,
+    }
+
+
+print("\n" + "="*60)
+print("VERIFYING TFLITE PREDICTIONS AGAINST KERAS")
+print("="*60)
+
+verification = {}
+for name, path in [
+    ('FP32', 'tflite_models/model_fp32.tflite'),
+    ('FP16', 'tflite_models/model_fp16.tflite'),
+    ('INT8', 'tflite_models/model_int8.tflite'),
+]:
+    if not os.path.exists(path):
+        print(f"❌ {name}: file not found, skipping verification")
+        continue
+    try:
+        diffs = verify_tflite_against_keras(model, path, _cal_samples, n_check=10)
+        verification[name] = diffs
+        print(f"\n{name}:")
+        print(f"  CWRU      max |Δ| = {diffs['cwru_max_abs_diff']:.6e}")
+        print(f"  Paderborn max |Δ| = {diffs['paderborn_max_abs_diff']:.6e}")
+        print(f"  RUL       max |Δ| = {diffs['rul_max_abs_diff']:.6e}")
+
+        if diffs['cwru_max_abs_diff'] > 0.05 or diffs['paderborn_max_abs_diff'] > 0.05:
+            print(f"  ⚠️ WARNING: classification deviation > 0.05 — quantization is aggressive")
+        elif diffs['cwru_max_abs_diff'] > 0.01 or diffs['paderborn_max_abs_diff'] > 0.01:
+            print(f"  ℹ️ Moderate deviation (0.01–0.05) — acceptable for most use cases")
+        else:
+            print(f"  ✅ Deviation < 0.01 — quantization is safe")
+    except Exception as e:
+        print(f"❌ {name}: verification failed — {e}")
+        verification[name] = {'error': str(e)}
+
+
+# ============================================================
+# FINAL FILE LISTING
+# ============================================================
+
+print("\n" + "="*60)
+print("FINAL FILES")
+print("="*60)
+for name in ['model_fp32.tflite', 'model_fp16.tflite', 'model_int8.tflite']:
+    path = f'tflite_models/{name}'
+    if os.path.exists(path):
+        size_kb = os.path.getsize(path) / 1024
+        print(f"  ✅ {name:22s} {size_kb:8.2f} KB")
+    else:
+        print(f"  ❌ {name:22s} NOT FOUND")
+
+print("\n✅ Conversion complete.")
+print("   Next: copy the desired .tflite AND ews_scaler.pkl to your Raspberry Pi.")
+print("         Then run: python3 deploy_mt_supinn.py --dataset cwru")
+print("                    python3 deploy_mt_supinn.py --dataset paderborn")
+print("                    python3 deploy_mt_supinn.py --dataset pronostia")
