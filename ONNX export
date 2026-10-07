@@ -1,0 +1,37 @@
+# ============================================================
+# K4: ONNX export (skip Keras save)
+# ============================================================
+!pip install tf2onnx onnx -q
+
+import tf2onnx
+import onnx
+import tensorflow as tf
+import os
+
+# Skip the .keras save — the model is already loaded and usable
+print("✅ Using in-memory Keras model")
+
+# Convert to ONNX
+spec = (
+    tf.TensorSpec((None, 1024, 4), tf.float32, name="vib"),
+    tf.TensorSpec((None, 11), tf.float32, name="ews"),
+)
+
+onnx_path = "/kaggle/working/mt_supinn_fp32.onnx"
+
+model_proto, _ = tf2onnx.convert.from_keras(
+    model,
+    input_signature=spec,
+    opset=13,
+    output_path=onnx_path,
+)
+
+size_kb = os.path.getsize(onnx_path) / 1024
+print(f"✅ ONNX saved: {onnx_path}")
+print(f"   Size: {size_kb:.2f} KB")
+
+# Verify
+onnx_model = onnx.load(onnx_path)
+onnx.checker.check_model(onnx_model)
+print(f"   Inputs:  {[i.name for i in onnx_model.graph.input]}")
+print(f"   Outputs: {[o.name for o in onnx_model.graph.output]}")
