@@ -1,0 +1,220 @@
+# ============================================================
+# K5: Integrated Gradients on CWRU (drop-in for SHAP)
+# ============================================================
+import os
+import numpy as np
+import tensorflow as tf
+import json
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+
+CWRU_DIR = "/kaggle/input/datasets/pleiades74/my-cwru/csv_files"
+WEIGHTS_PATH = "/kaggle/input/datasets/pleiades74/weight-42-full-h5/mt_supinn_weights.weights.h5"
+SCALER_PATH = "/kaggle/input/datasets/pleiades74/ews-scaler42full/ews_scaler.pkl"
+
+config = MultiModalConfig()
+model = build_multimodal_model(config)
+model.load_weights(WEIGHTS_PATH)
+scaler = joblib.load(SCALER_PATH)
+print("✅ Model and scaler loaded")
+
+# ---- Reload data ----
+cwru_loader = CWRULoader(CWRU_DIR, config)
+X_c_vib, X_c_ews, y_c_class, y_c_sev, c_files = cwru_loader.load()
+
+# ---- Rebuild split ----
+cwru_class_names = ['Normal', 'Ball', 'InnerRace', 'OuterRace']
+cwru_label_map = {n: i for i, n in enumerate(cwru_class_names)}
+
+def get_lbl(fn):
+    fl = fn.lower()
+    if 'normal' in fl: return cwru_label_map['Normal']
+    elif 'ball' in fl: return cwru_label_map['Ball']
+    elif 'inner' in fl or 'ir' in fl: return cwru_label_map['InnerRace']
+    elif 'outer' in fl or 'or' in fl: return cwru_label_map['OuterRace']
+    return -1
+
+unique_files = sorted(set(c_files))
+file_labels = [get_lbl(fn) for fn in unique_files]
+valid = [i for i, l in enumerate(file_labels) if l != -1]
+unique_files = [unique_files[i] for i in valid]
+file_labels = [file_labels[i] for i in valid]
+
+train_val_files, test_files = train_test_split(
+    unique_files, test_size=0.2, random_state=42, stratify=file_labels
+)
+train_val_labels = [file_labels[unique_files.index(f)] for f in train_val_files]
+train_files, val_files = train_test_split(
+    train_val_files, test_size=0.25, random_state=42, stratify=train_val_labels
+)
+
+def idxs(file_list):
+    return [i for i, f in enumerate(c_files) if f in file_list]
+
+c_train_idx = idxs(train_files)
+c_test_idx = idxs(test_files)
+
+X_c_train_padded = np.zeros((len(c_train_idx), config.window_size, 4), dtype=np.float32)
+X_c_train_padded[:, :, :3] = X_c_vib[c_train_idx]
+X_c_ews_train = scaler.transform(X_c_ews[c_train_idx])
+
+X_c_test_padded = np.zeros((len(c_test_idx), config.window_size, 4), dtype=np.float32)
+X_c_test_padded[:, :, :3] = X_c_vib[c_test_idx]
+X_c_ews_test = scaler.transform(X_c_ews[c_test_idx])
+
+n_bg = min(80, len(c_train_idx))
+n_explain = min(15, len(c_test_idx))
+bg_vib = X_c_train_padded[:n_bg].astype(np.float32)
+bg_ews = X_c_ews_train[:n_bg].astype(np.float32)
+explain_vib = X_c_test_padded[:n_explain].astype(np.float32)
+explain_ews = X_c_ews_test[:n_explain].astype(np.float32)
+print(f"Background: {n_bg}, Explain: {n_explain}")
+
+# ============================================================
+# Integrated Gradients
+# ============================================================
+# We compute attribution for the *predicted class probability*
+# for each explained sample. Baseline = mean of background set.
+# ============================================================
+
+# Baseline: mean over the background set (single reference point)
+baseline_vib = np.mean(bg_vib, axis=0, keepdims=True).astype(np.float32)  # (1, 1024, 4)
+baseline_ews = np.mean(bg_ews, axis=0, keepdims=True).astype(np.float32)  # (1, 11)
+
+
+def integrated_gradients(model, vib, ews, baseline_vib, baseline_ews,
+                         n_steps=32, target_class=None):
+    """
+    Compute Integrated Gradients for a multi-modal model.
+
+    Args:
+        model:        trained Keras model returning dict with 'cwru_class'
+        vib:          (N, 1024, 4) float32
+        ews:          (N, 11)      float32
+        baseline_vib: (1, 1024, 4) float32
+        baseline_ews: (1, 11)      float32
+        n_steps:      number of Riemann steps along the path
+        target_class: int or None. If None, use argmax per sample.
+
+    Returns:
+        ig_vib: (N, 1024, 4) attributions
+        ig_ews: (N, 11)      attributions
+    """
+    vib = tf.convert_to_tensor(vib, dtype=tf.float32)
+    ews = tf.convert_to_tensor(ews, dtype=tf.float32)
+    bv = tf.convert_to_tensor(baseline_vib, dtype=tf.float32)
+    be = tf.convert_to_tensor(baseline_ews, dtype=tf.float32)
+
+    N = tf.shape(vib)[0]
+
+    # Broadcast baseline to match batch
+    bv = tf.tile(bv, [N, 1, 1])
+    be = tf.tile(be, [N, 1])
+
+    # Determine target class per sample
+    if target_class is None:
+        preds = model([vib, ews], training=False)['cwru_class']
+        targets = tf.argmax(preds, axis=-1)  # (N,)
+    else:
+        targets = tf.fill([N], target_class)
+
+    # Build alphas: (n_steps,)
+    alphas = tf.linspace(0.0, 1.0, n_steps + 1)[1:]  # skip alpha=0
+    alphas = tf.cast(alphas, tf.float32)
+
+    # Accumulate gradients
+    total_grad_vib = tf.zeros_like(vib)
+    total_grad_ews = tf.zeros_like(ews)
+
+    for alpha in tf.unstack(alphas):
+        # Interpolated inputs along straight-line path
+        interp_vib = bv + alpha * (vib - bv)
+        interp_ews = be + alpha * (ews - be)
+
+        with tf.GradientTape() as tape:
+            tape.watch([interp_vib, interp_ews])
+            preds = model([interp_vib, interp_ews], training=False)['cwru_class']
+            # Gather target-class probability per sample
+            idx = tf.stack([tf.range(N), targets], axis=1)
+            target_probs = tf.gather_nd(preds, idx)  # (N,)
+            loss = tf.reduce_sum(target_probs)
+
+        grads = tape.gradient(loss, [interp_vib, interp_ews])
+        total_grad_vib += grads[0]
+        total_grad_ews += grads[1]
+
+    avg_grad_vib = total_grad_vib / tf.cast(n_steps, tf.float32)
+    avg_grad_ews = total_grad_ews / tf.cast(n_steps, tf.float32)
+
+    # IG = (input - baseline) * avg_grad
+    ig_vib = (vib - bv) * avg_grad_vib
+    ig_ews = (ews - be) * avg_grad_ews
+
+    return ig_vib.numpy(), ig_ews.numpy()
+
+
+print("\nRunning Integrated Gradients...")
+ig_vib, ig_ews = integrated_gradients(
+    model, explain_vib, explain_ews,
+    baseline_vib, baseline_ews,
+    n_steps=32, target_class=None,
+)
+print(f"✅ IG computed. ig_vib shape: {ig_vib.shape}, ig_ews shape: {ig_ews.shape}")
+
+# ============================================================
+# Analysis (identical downstream logic)
+# ============================================================
+ews_names = ['RMS', 'Peak', 'Crest', 'Std', 'Skew', 'Kurt',
+             'P2P', 'Shape', 'Impulse', 'Clearance', 'Autocorr']
+channel_names = ['Vibration', 'Current-1', 'Current-2', 'Temperature']
+
+ews_imp = np.mean(np.abs(ig_ews), axis=0)               # (11,)
+vib_imp = np.mean(np.abs(ig_vib), axis=(0, 1))          # (4,)
+
+print("\n📊 IG EWS importance (top-5):")
+for i in np.argsort(ews_imp)[::-1][:5]:
+    print(f"   {ews_names[i]:12s}: {ews_imp[i]:.6f}")
+
+print("\n📊 IG channel importance:")
+for i in np.argsort(vib_imp)[::-1]:
+    print(f"   {channel_names[i]:12s}: {vib_imp[i]:.6f}")
+
+# ============================================================
+# Save outputs
+# ============================================================
+out_dir = "/kaggle/working/shap_cwru"
+os.makedirs(out_dir, exist_ok=True)
+
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.bar(range(11), ews_imp, color='steelblue', edgecolor='black')
+ax.set_xticks(range(11))
+ax.set_xticklabels(ews_names, rotation=45, ha='right')
+ax.set_ylabel('Mean |IG|', fontweight='bold')
+ax.set_title('Integrated Gradients — EWS importance (CWRU)', fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(out_dir, 'ig_ews_importance.png'), dpi=300)
+plt.savefig(os.path.join(out_dir, 'ig_ews_importance.pdf'))
+plt.close()
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.bar(channel_names, vib_imp, color='darkorange', edgecolor='black')
+ax.set_ylabel('Mean |IG|', fontweight='bold')
+ax.set_title('Integrated Gradients — channel importance (CWRU)', fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(out_dir, 'ig_channel_importance.png'), dpi=300)
+plt.savefig(os.path.join(out_dir, 'ig_channel_importance.pdf'))
+plt.close()
+
+with open(os.path.join(out_dir, 'ig_summary.json'), 'w') as f:
+    json.dump({
+        'ews_importance': {n: float(v) for n, v in zip(ews_names, ews_imp)},
+        'channel_importance': {n: float(v) for n, v in zip(channel_names, vib_imp)},
+        'n_explained': int(n_explain),
+        'n_background': int(n_bg),
+        'method': 'Integrated Gradients',
+        'n_steps': 32,
+        'baseline': 'mean of background set',
+        'target': 'argmax class per sample',
+    }, f, indent=2)
+
+print(f"\n✅ Saved to {out_dir}")
