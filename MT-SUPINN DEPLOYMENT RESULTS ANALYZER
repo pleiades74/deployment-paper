@@ -1,0 +1,1018 @@
+### =============================================
+# MT-SUPINN DEPLOYMENT RESULTS ANALYZER
+# RESEARCH GRADE - FULLY FIXED
+# =============================================
+
+import pandas as pd
+import numpy as np
+import os
+from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+import re
+import csv
+import warnings
+from collections import Counter
+warnings.filterwarnings('ignore')
+
+# =============================================
+# CONFIGURATION
+# =============================================
+
+CWRU_CLASSES = {
+    0: 'Normal',
+    1: 'Ball', 
+    2: 'InnerRace',
+    3: 'OuterRace'
+}
+
+PADERBORN_CLASSES = {
+    0: 'Normal',
+    1: 'InnerRace',
+    2: 'OuterRace'
+}
+
+# =============================================
+# PADERBORN GROUND-TRUTH MAPPING (FIXED)
+# =============================================
+
+PADERBORN_BEARING_MAP = {
+    # Healthy bearings (K00x series)
+    'K001': ('Normal', 0),
+    'K002': ('Normal', 0),
+    'K003': ('Normal', 0),
+    'K004': ('Normal', 0),
+    'K005': ('Normal', 0),
+    'K006': ('Normal', 0),
+    
+    # Artificial faults - Outer Race
+    'KA01': ('OuterRace', 2),
+    'KA03': ('OuterRace', 2),
+    'KA04': ('OuterRace', 2),
+    'KA05': ('OuterRace', 2),
+    'KA06': ('OuterRace', 2),
+    'KA07': ('OuterRace', 2),
+    'KA08': ('OuterRace', 2),
+    'KA09': ('OuterRace', 2),
+    'KA10': ('OuterRace', 2),
+    'KA11': ('OuterRace', 2),
+    'KA12': ('OuterRace', 2),
+    'KA15': ('OuterRace', 2),
+    'KA16': ('OuterRace', 2),
+    'KA22': ('OuterRace', 2),
+    'KA30': ('OuterRace', 2),
+    
+    # Artificial faults - Inner Race
+    'KI01': ('InnerRace', 1),
+    'KI03': ('InnerRace', 1),
+    'KI04': ('InnerRace', 1),
+    'KI05': ('InnerRace', 1),
+    'KI07': ('InnerRace', 1),
+    'KI08': ('InnerRace', 1),
+    'KI09': ('InnerRace', 1),
+    'KI10': ('InnerRace', 1),
+    'KI11': ('InnerRace', 1),
+    'KI12': ('InnerRace', 1),
+    'KI13': ('InnerRace', 1),
+    'KI14': ('InnerRace', 1),
+    'KI16': ('InnerRace', 1),
+    'KI17': ('InnerRace', 1),
+    'KI18': ('InnerRace', 1),
+    'KI21': ('InnerRace', 1),
+    
+    # Realistic damages - Outer Race
+    'KA04_R': ('OuterRace', 2),
+    'KA15_R': ('OuterRace', 2),
+    'KA16_R': ('OuterRace', 2),
+    'KA22_R': ('OuterRace', 2),
+    'KA30_R': ('OuterRace', 2),
+    
+    # Realistic damages - Inner Race
+    'KI04_R': ('InnerRace', 1),
+    'KI14_R': ('InnerRace', 1),
+    'KI16_R': ('InnerRace', 1),
+    'KI18_R': ('InnerRace', 1),
+    'KI21_R': ('InnerRace', 1),
+    
+    # KB series - outer race
+    'KB23': ('OuterRace', 2),
+    'KB24': ('OuterRace', 2),
+    'KB27': ('OuterRace', 2),
+}
+
+def extract_bearing_code(filename):
+    """
+    Extract bearing code from Paderborn filename.
+    
+    Examples:
+    N09_M07_F10_KA01_1.mat → KA01
+    N15_M01_F10_KA01_10.mat → KA01
+    N09_M07_F10_KA01_R_1.mat → KA01_R
+    """
+    name = filename.replace('.mat', '').replace('.csv', '')
+    
+    patterns = [
+        r'(K[A-Z]\d{2}(?:_R)?)',  # KA01, KI04, KA01_R
+        r'(K\d{3})',               # K001, K002
+        r'(KB\d{2})'               # KB23, KB24
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, name, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    
+    # Fallback: find any K pattern
+    match = re.search(r'(K[A-Z]?\d{2,3})', name, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    
+    return None
+
+def parse_paderborn_ground_truth(filename):
+    """
+    Get ground truth class for Paderborn filename using bearing code mapping.
+    """
+    bearing_code = extract_bearing_code(filename)
+    
+    if bearing_code is None:
+        return 'Unknown', -1
+    
+    # Check if we have a direct mapping
+    if bearing_code in PADERBORN_BEARING_MAP:
+        return PADERBORN_BEARING_MAP[bearing_code]
+    
+    # If not found, infer from code
+    if bearing_code.startswith('K0') or bearing_code.startswith('K00'):
+        return 'Normal', 0
+    elif bearing_code.startswith('KA') or bearing_code.startswith('KB') or bearing_code.startswith('KC'):
+        return 'OuterRace', 2
+    elif bearing_code.startswith('KI'):
+        return 'InnerRace', 1
+    
+    print(f"⚠️ Unknown bearing code: {bearing_code} from file: {filename}")
+    return 'Unknown', -1
+
+# =============================================
+# CWRU GROUND-TRUTH PARSING
+# =============================================
+
+# =============================================
+# CWRU - 3-CLASS CONFIGURATION (Matches Your Model)
+# =============================================
+
+# Your model only has 3 output classes
+# Class 0: Normal
+# Class 2: InnerRace  
+# Class 3: OuterRace
+# (Class 1 is unused)
+
+CWRU_CLASSES = {
+    0: 'Normal',
+    2: 'InnerRace',   # Note: Class 2, not class 1
+    3: 'OuterRace'    # Note: Class 3, not class 2
+}
+
+def parse_cwru_ground_truth(filename):
+    """
+    Parse CWRU ground truth for 3-class model.
+    Ball files are excluded from evaluation.
+    """
+    filename_lower = filename.lower()
+    
+    if 'normal' in filename_lower:
+        return 'Normal', 0
+    elif 'b007' in filename_lower or 'b014' in filename_lower or 'b021' in filename_lower:
+        # Ball is NOT a valid class in this model
+        # Return -1 to exclude from evaluation
+        return 'Unknown', -1
+    elif 'ir' in filename_lower or 'inner' in filename_lower:
+        return 'InnerRace', 2
+    elif 'or' in filename_lower or 'outer' in filename_lower:
+        return 'OuterRace', 3
+    else:
+        return 'Unknown', -1
+
+# =============================================
+# PROBABILITY PARSING
+# =============================================
+
+def parse_probabilities(prob_str):
+    """
+    Parse probability arrays from CSV.
+    Handles: [0.0037, 0.0001, 0.9961] or [0.0037 0.0001 0.9961]
+    """
+    if not prob_str or prob_str == '[]':
+        return []
+    
+    prob_str = prob_str.strip()
+    prob_str = prob_str.strip('[]')
+    
+    # Split by comma or space
+    if ',' in prob_str:
+        parts = [p.strip() for p in prob_str.split(',') if p.strip()]
+    else:
+        parts = [p.strip() for p in prob_str.split() if p.strip()]
+    
+    result = []
+    for p in parts:
+        try:
+            result.append(float(p))
+        except ValueError:
+            continue
+    
+    return result
+
+# =============================================
+# LOAD FUNCTIONS
+# =============================================
+
+def load_cwru_predictions(file_path):
+    """Load CWRU predictions."""
+    data = []
+    num_classes = 4
+    
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+    
+    if not lines:
+        return pd.DataFrame()
+    
+    has_header = any(k in lines[0].lower() for k in ['file', 'start', 'class', 'confidence', 'probabilities', 'time'])
+    start_idx = 1 if has_header else 0
+    
+    for line in lines[start_idx:]:
+        line = line.strip()
+        if not line:
+            continue
+        
+        try:
+            parts = list(csv.reader([line], delimiter=',', quotechar='"'))[0]
+        except:
+            parts = line.split(',')
+        
+        if len(parts) < 6:
+            continue
+        
+        filename = parts[0].strip()
+        
+        try:
+            window_start = int(float(parts[1].strip()))
+        except ValueError:
+            window_start = 0
+        
+        try:
+            predicted_class = int(float(parts[2].strip()))
+        except ValueError:
+            predicted_class = -1
+        
+        try:
+            confidence = float(parts[3].strip())
+        except ValueError:
+            confidence = 0.5
+        
+        probs = parse_probabilities(parts[4])
+        
+        while len(probs) < num_classes:
+            probs.append(0.0)
+        probs = probs[:num_classes]
+        
+        try:
+            inference_time = float(parts[5].strip())
+        except ValueError:
+            inference_time = 0.0
+        
+        if predicted_class < 0 or predicted_class >= len(probs):
+            prob_sum = sum(probs)
+            if prob_sum > 0:
+                predicted_class = int(np.argmax(probs))
+                confidence = float(probs[predicted_class])
+            else:
+                predicted_class = 0
+                confidence = 0.0
+        
+        data.append({
+            'filename': filename,
+            'window_start': window_start,
+            'predicted_class': predicted_class,
+            'confidence': min(max(confidence, 0.0), 1.0),
+            'inference_time_ms': inference_time,
+            'probabilities': probs,
+            **{f'prob_{i}': probs[i] if i < len(probs) else 0.0 for i in range(num_classes)}
+        })
+    
+    df = pd.DataFrame(data)
+    print(f"   Parsed {len(df)} rows from CWRU log")
+    return df
+
+def load_paderborn_predictions(file_path):
+    """Load Paderborn predictions."""
+    data = []
+    num_classes = 3
+    
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+    
+    if not lines:
+        return pd.DataFrame()
+    
+    has_header = any(k in lines[0].lower() for k in ['file', 'start', 'class', 'confidence', 'probabilities', 'time'])
+    start_idx = 1 if has_header else 0
+    
+    for line in lines[start_idx:]:
+        line = line.strip()
+        if not line:
+            continue
+        
+        try:
+            parts = list(csv.reader([line], delimiter=',', quotechar='"'))[0]
+        except:
+            parts = line.split(',')
+        
+        if len(parts) < 6:
+            continue
+        
+        filename = parts[0].strip()
+        
+        try:
+            window_start = int(float(parts[1].strip()))
+        except ValueError:
+            window_start = 0
+        
+        try:
+            predicted_class = int(float(parts[2].strip()))
+        except ValueError:
+            predicted_class = -1
+        
+        try:
+            confidence = float(parts[3].strip())
+        except ValueError:
+            confidence = 0.5
+        
+        probs = parse_probabilities(parts[4])
+        
+        while len(probs) < num_classes:
+            probs.append(0.0)
+        probs = probs[:num_classes]
+        
+        try:
+            inference_time = float(parts[5].strip())
+        except ValueError:
+            inference_time = 0.0
+        
+        if predicted_class < 0 or predicted_class >= len(probs):
+            prob_sum = sum(probs)
+            if prob_sum > 0:
+                predicted_class = int(np.argmax(probs))
+                confidence = float(probs[predicted_class])
+            else:
+                predicted_class = 0
+                confidence = 0.0
+        
+        data.append({
+            'filename': filename,
+            'window_start': window_start,
+            'predicted_class': predicted_class,
+            'confidence': min(max(confidence, 0.0), 1.0),
+            'inference_time_ms': inference_time,
+            'probabilities': probs,
+            **{f'prob_{i}': probs[i] if i < len(probs) else 0.0 for i in range(num_classes)}
+        })
+    
+    df = pd.DataFrame(data)
+    print(f"   Parsed {len(df)} rows from Paderborn log")
+    return df
+
+def load_pronostia_predictions(file_path):
+    """Load PRONOSTIA predictions (supports both column-name conventions)."""
+    df = pd.read_csv(file_path)
+    if 'window_start' in df.columns and 'start' not in df.columns:
+        df = df.rename(columns={'window_start': 'start'})
+    if 'time_ms' in df.columns and 'inference_time_ms' not in df.columns:
+        df = df.rename(columns={'time_ms': 'inference_time_ms'})
+    print(f"   Parsed {len(df)} rows from PRONOSTIA log")
+    return df
+# =============================================
+# PRONOSTIA RMSE/MAE CALCULATION (ADD THIS)
+# =============================================
+
+def analyze_pronostia_with_ground_truth(predictions_file, ground_truth_file):
+    """
+    Merge Pronostia deployment predictions with ground truth.
+
+    The deploy script and ground-truth script slice windows the same way
+    within each file, so we align by (bearing, file) + rank within file.
+    The window_start value differs because the deploy script uses a
+    global bearing-level counter while the ground truth resets per file,
+    so we ignore it for matching.
+    """
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+    df_pred = pd.read_csv(predictions_file)
+    df_true = pd.read_csv(ground_truth_file)
+
+    print(f"   Predictions rows:  {len(df_pred)}")
+    print(f"   Ground truth rows: {len(df_true)}")
+    print(f"   Predictions columns:  {df_pred.columns.tolist()}")
+    print(f"   Ground truth columns: {df_true.columns.tolist()}")
+
+    # ---- Validate schema ----
+    for col in ('bearing', 'file', 'window_start', 'rul'):
+        if col not in df_pred.columns:
+            print(f"   ❌ Predictions missing column: {col}")
+            return None, None
+        if col not in df_true.columns:
+            print(f"   ❌ Ground truth missing column: {col}")
+            return None, None
+
+    # ---- Sort and rank within each (bearing, file) ----
+    df_pred = df_pred.sort_values(['bearing', 'file', 'window_start']).reset_index(drop=True)
+    df_true = df_true.sort_values(['bearing', 'file', 'window_start']).reset_index(drop=True)
+
+    df_pred['rank'] = df_pred.groupby(['bearing', 'file']).cumcount()
+    df_true['rank'] = df_true.groupby(['bearing', 'file']).cumcount()
+
+    # ---- Merge by (bearing, file, rank) ----
+    df_merged = df_pred.merge(
+        df_true[['bearing', 'file', 'rank', 'rul']],
+        on=['bearing', 'file', 'rank'],
+        how='inner',
+        suffixes=('_pred', '_true'),
+    )
+
+    match_rate = len(df_merged) / max(1, min(len(df_pred), len(df_true)))
+    print(f"   Matched rows: {len(df_merged)} (match rate = {match_rate:.2%})")
+
+    if len(df_merged) == 0:
+        return None, None
+
+    # ---- Per-bearing breakdown ----
+    print("\n   Per-bearing RMSE:")
+    for bearing, group in df_merged.groupby('bearing'):
+        b_rmse = np.sqrt(mean_squared_error(group['rul_true'], group['rul_pred']))
+        print(f"     {bearing}: n={len(group)}, RMSE={b_rmse:.4f}")
+
+    # ---- Overall metrics ----
+    y_pred = df_merged['rul_pred'].values
+    y_true = df_merged['rul_true'].values
+
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae  = mean_absolute_error(y_true, y_pred)
+    r2   = r2_score(y_true, y_pred)
+    err  = y_true - y_pred
+
+    print(f"\n   ✅ Aligned {len(y_pred)} samples")
+    print(f"   RMSE: {rmse:.4f}")
+    print(f"   MAE:  {mae:.4f}")
+    print(f"   R²:   {r2:.4f}")
+    print(f"   Max |error|: {np.max(np.abs(err)):.4f}")
+    print(f"   Mean error:  {np.mean(err):+.4f}")
+    print(f"   Std error:   {np.std(err):.4f}")
+
+    results = {
+        'rmse': rmse, 'mae': mae, 'r2': r2,
+        'max_error': float(np.max(np.abs(err))),
+        'mean_error': float(np.mean(err)),
+        'std_error': float(np.std(err)),
+        'n_samples': len(y_pred),
+        'match_rate': match_rate,
+    }
+
+    df_merged_out = df_merged[['bearing', 'file', 'rank',
+                                'rul_pred', 'rul_true']].copy()
+    return results, df_merged_out
+def print_pronostia_accuracy_report(results):
+    """Print RMSE/MAE report for Pronostia."""
+    if results is None:
+        print("❌ No Pronostia accuracy results to display")
+        return
+    
+    print("\n" + "="*70)
+    print("PRONOSTIA DEPLOYMENT ACCURACY (vs Ground Truth)")
+    print("="*70)
+    print(f"\n📊 ACCURACY METRICS:")
+    print(f"   RMSE: {results['rmse']:.4f}")
+    print(f"   MAE:  {results['mae']:.4f}")
+    print(f"   R²:   {results['r2']:.4f}")
+    
+    print(f"\n📊 ERROR STATISTICS:")
+    print(f"   Max error:   {results['max_error']:.4f}")
+    print(f"   Mean error:  {results['mean_error']:.4f}")
+    print(f"   Std error:   {results['std_error']:.4f}")
+    
+    print(f"\n📊 SAMPLE COUNT:")
+    print(f"   Aligned samples: {results['n_samples']:,}")
+    
+    print("\n" + "="*70)
+
+def plot_pronostia_accuracy(df_merged, output_dir='.'):
+    """Plot Pronostia predictions vs ground truth."""
+    if df_merged is None or len(df_merged) == 0:
+        return
+    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Scatter plot
+    ax1 = axes[0]
+    ax1.scatter(df_merged['rul_true'], df_merged['rul_pred'], alpha=0.5, s=5, c='steelblue')
+    ax1.plot([0, 1], [0, 1], 'r--', linewidth=2, label='Ideal')
+    ax1.set_xlabel('True RUL')
+    ax1.set_ylabel('Predicted RUL')
+    ax1.set_title('Pronostia: Predictions vs Ground Truth')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Error histogram
+    ax2 = axes[1]
+    errors = df_merged['rul_true'] - df_merged['rul_pred']
+    ax2.hist(errors, bins=50, color='steelblue', edgecolor='black', alpha=0.7)
+    ax2.axvline(x=0, color='red', linestyle='--', linewidth=2)
+    ax2.set_xlabel('Prediction Error (True - Predicted)')
+    ax2.set_ylabel('Frequency')
+    ax2.set_title('Pronostia: Error Distribution')
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'PRONOSTIA_ACCURACY.pdf'), dpi=300)
+    plt.close()
+    print(f"✅ Saved: PRONOSTIA_ACCURACY.pdf")
+# =============================================
+# ANALYSIS ENGINE
+# =============================================
+
+def analyze_predictions(df, class_mapping, ground_truth_parser, dataset_name=""):
+    """
+    Complete analysis with window-level and file-level metrics.
+    """
+    results = {}
+    
+    if len(df) == 0:
+        print(f"⚠️ No data to analyze for {dataset_name}")
+        return results
+    
+    # Add ground truth
+    df['true_class_name'], df['true_class_idx'] = zip(*df['filename'].apply(ground_truth_parser))
+    
+    df_original_len = len(df)
+    df = df[df['true_class_idx'] >= 0].copy()
+    if len(df) == 0:
+        print(f"⚠️ No valid ground truth found for {dataset_name}")
+        return results
+    
+    print(f"   Ground truth assigned to {len(df)} rows ({df_original_len - len(df)} skipped)")
+    
+    # Window-level metrics
+    df['window_correct'] = df['true_class_idx'] == df['predicted_class']
+    window_accuracy = df['window_correct'].mean()
+    total_windows = len(df)
+    correct_windows = df['window_correct'].sum()
+    
+    # File-level metrics (majority voting)
+    file_results = []
+    for filename, group in df.groupby('filename'):
+        true_class_idx = group['true_class_idx'].iloc[0]
+        true_class_name = group['true_class_name'].iloc[0]
+        
+        pred_classes = group['predicted_class'].tolist()
+        majority_class = Counter(pred_classes).most_common(1)[0][0]
+        
+        mean_confidence = group['confidence'].mean()
+        window_acc = group['window_correct'].mean()
+        
+        # Count votes per class
+        vote_counts = Counter(pred_classes)
+        majority_votes = vote_counts[majority_class]
+        total_votes = len(pred_classes)
+        
+        file_results.append({
+            'filename': filename,
+            'true_class_idx': true_class_idx,
+            'true_class_name': true_class_name,
+            'predicted_class': majority_class,
+            'is_correct': true_class_idx == majority_class,
+            'window_accuracy': window_acc,
+            'mean_confidence': mean_confidence,
+            'num_windows': total_votes,
+            'correct_windows': group['window_correct'].sum(),
+            'majority_votes': majority_votes,
+            'majority_percent': majority_votes / total_votes * 100
+        })
+    
+    file_df = pd.DataFrame(file_results)
+    file_accuracy = file_df['is_correct'].mean()
+    
+    results['window_level'] = {
+        'total_windows': total_windows,
+        'correct_windows': correct_windows,
+        'accuracy': window_accuracy,
+        'accuracy_percent': window_accuracy * 100
+    }
+    
+    results['file_level'] = {
+        'total_files': len(file_df),
+        'correct_files': file_df['is_correct'].sum(),
+        'accuracy': file_accuracy,
+        'accuracy_percent': file_accuracy * 100
+    }
+    
+    # Per-class metrics (file-level)
+    per_class = []
+    for class_idx, class_name in class_mapping.items():
+        class_df = file_df[file_df['true_class_idx'] == class_idx]
+        if len(class_df) > 0:
+            class_correct = class_df['is_correct'].sum()
+            class_total = len(class_df)
+            per_class.append({
+                'class_idx': class_idx,
+                'class_name': class_name,
+                'total_files': class_total,
+                'correct_files': class_correct,
+                'accuracy': class_correct / class_total if class_total > 0 else 0,
+                'accuracy_percent': (class_correct / class_total * 100) if class_total > 0 else 0
+            })
+    
+    results['per_class'] = pd.DataFrame(per_class) if per_class else pd.DataFrame()
+    
+    # Confusion Matrix (file-level)
+    classes = list(class_mapping.keys())
+    cm = np.zeros((len(classes), len(classes)), dtype=int)
+    for i, true_idx in enumerate(classes):
+        for j, pred_idx in enumerate(classes):
+            cm[i, j] = len(file_df[(file_df['true_class_idx'] == true_idx) & 
+                                   (file_df['predicted_class'] == pred_idx)])
+    results['confusion_matrix'] = cm
+    results['confusion_matrix_df'] = pd.DataFrame(
+        cm,
+        index=[class_mapping[c] for c in classes],
+        columns=[class_mapping[c] for c in classes]
+    )
+    
+    # Confidence analysis
+    results['confidence_stats'] = {
+        'mean': df['confidence'].mean(),
+        'std': df['confidence'].std(),
+        'min': df['confidence'].min(),
+        'max': df['confidence'].max(),
+        'median': df['confidence'].median()
+    }
+    
+    correct_conf = df[df['window_correct']]['confidence'].mean() if df[df['window_correct']].shape[0] > 0 else 0
+    incorrect_conf = df[~df['window_correct']]['confidence'].mean() if df[~df['window_correct']].shape[0] > 0 else 0
+    
+    results['confidence_by_correct'] = {
+        'correct_mean': correct_conf,
+        'incorrect_mean': incorrect_conf
+    }
+    
+    # Latency statistics
+    results['latency_stats'] = {
+        'mean_ms': df['inference_time_ms'].mean(),
+        'std_ms': df['inference_time_ms'].std(),
+        'min_ms': df['inference_time_ms'].min(),
+        'max_ms': df['inference_time_ms'].max(),
+        'median_ms': df['inference_time_ms'].median(),
+        'p95_ms': df['inference_time_ms'].quantile(0.95),
+        'p99_ms': df['inference_time_ms'].quantile(0.99)
+    }
+    
+    # Class distribution
+    results['true_distribution'] = file_df['true_class_name'].value_counts().to_dict()
+    results['predicted_distribution'] = file_df['predicted_class'].map(
+        lambda x: class_mapping.get(x, 'Unknown')).value_counts().to_dict()
+    
+    results['df'] = df
+    results['file_df'] = file_df
+    
+    return results
+
+def analyze_pronostia_results(df):
+    """Generate PRONOSTIA analysis results."""
+    results = {}
+    if len(df) == 0:
+        return results
+    
+    results['count'] = len(df)
+    results['rul_mean'] = df['rul'].mean()
+    results['rul_std'] = df['rul'].std()
+    results['rul_min'] = df['rul'].min()
+    results['rul_max'] = df['rul'].max()
+    results['rul_median'] = df['rul'].median()
+    
+    results['latency_mean'] = df['inference_time_ms'].mean()
+    results['latency_std'] = df['inference_time_ms'].std()
+    results['latency_min'] = df['inference_time_ms'].min()
+    results['latency_max'] = df['inference_time_ms'].max()
+    results['latency_p95'] = df['inference_time_ms'].quantile(0.95)
+    results['latency_p99'] = df['inference_time_ms'].quantile(0.99)
+    
+    results['rul_healthy'] = (df['rul'] >= 0.8).sum()
+    results['rul_warning'] = ((df['rul'] >= 0.5) & (df['rul'] < 0.8)).sum()
+    results['rul_critical'] = ((df['rul'] >= 0.2) & (df['rul'] < 0.5)).sum()
+    results['rul_failing'] = (df['rul'] < 0.2).sum()
+    
+    return results
+
+# =============================================
+# PRINT REPORTS
+# =============================================
+
+def print_report(results, dataset_name):
+    """Print formatted report."""
+    if not results:
+        print(f"No results to display for {dataset_name}")
+        return
+    
+    print("\n" + "="*70)
+    print(f"{dataset_name} DEPLOYMENT RESULTS")
+    print("="*70)
+    
+    if 'window_level' in results:
+        w = results['window_level']
+        print(f"\n📊 WINDOW-LEVEL ACCURACY:")
+        print(f"   Total windows: {w['total_windows']:,}")
+        print(f"   Correct windows: {w['correct_windows']:,}")
+        print(f"   Accuracy: {w['accuracy_percent']:.2f}%")
+    
+    if 'file_level' in results:
+        f = results['file_level']
+        print(f"\n📊 FILE-LEVEL ACCURACY (Majority Vote):")
+        print(f"   Total files: {f['total_files']:,}")
+        print(f"   Correct files: {f['correct_files']:,}")
+        print(f"   Accuracy: {f['accuracy_percent']:.2f}%")
+    
+    if 'per_class' in results and len(results['per_class']) > 0:
+        print(f"\n📊 PER-CLASS ACCURACY (File-Level):")
+        for _, row in results['per_class'].iterrows():
+            print(f"   {row['class_name']}: {row['accuracy_percent']:.2f}% ({row['correct_files']}/{row['total_files']})")
+    
+    if 'confusion_matrix_df' in results and len(results['confusion_matrix_df']) > 0:
+        print(f"\n📊 CONFUSION MATRIX (File-Level):")
+        print(results['confusion_matrix_df'])
+    
+    if 'confidence_stats' in results:
+        c = results['confidence_stats']
+        print(f"\n📊 CONFIDENCE STATISTICS:")
+        print(f"   Mean: {c['mean']:.4f}")
+        print(f"   Std: {c['std']:.4f}")
+        print(f"   Min: {c['min']:.4f}")
+        print(f"   Max: {c['max']:.4f}")
+        
+        if 'confidence_by_correct' in results:
+            cb = results['confidence_by_correct']
+            print(f"   Correct predictions mean: {cb['correct_mean']:.4f}")
+            print(f"   Incorrect predictions mean: {cb['incorrect_mean']:.4f}")
+    
+    if 'latency_stats' in results:
+        l = results['latency_stats']
+        print(f"\n📊 INFERENCE TIME (on Raspberry Pi 5):")
+        print(f"   Mean: {l['mean_ms']:.2f} ms")
+        print(f"   Std: {l['std_ms']:.2f} ms")
+        print(f"   Min: {l['min_ms']:.2f} ms")
+        print(f"   Max: {l['max_ms']:.2f} ms")
+        print(f"   95th percentile: {l['p95_ms']:.2f} ms")
+        print(f"   99th percentile: {l['p99_ms']:.2f} ms")
+    
+    if 'true_distribution' in results:
+        print(f"\n📊 CLASS DISTRIBUTION (Files):")
+        for class_name, count in results['true_distribution'].items():
+            print(f"   {class_name}: {count} files")
+    
+    print("\n" + "="*70)
+
+def print_pronostia_report(results):
+    """Print PRONOSTIA report."""
+    if not results:
+        print("No PRONOSTIA results to display")
+        return
+    
+    print("\n" + "="*70)
+    print("PRONOSTIA DEPLOYMENT RESULTS")
+    print("="*70)
+    
+    print(f"\n📊 RUL STATISTICS:")
+    print(f"   Total predictions: {results['count']:,}")
+    print(f"   RUL mean: {results['rul_mean']:.4f}")
+    print(f"   RUL std: {results['rul_std']:.4f}")
+    print(f"   RUL min: {results['rul_min']:.4f}")
+    print(f"   RUL max: {results['rul_max']:.4f}")
+    print(f"   RUL median: {results['rul_median']:.4f}")
+    
+    print(f"\n📊 RUL DISTRIBUTION:")
+    print(f"   Healthy (RUL >= 0.8): {results['rul_healthy']}")
+    print(f"   Warning (0.5 <= RUL < 0.8): {results['rul_warning']}")
+    print(f"   Critical (0.2 <= RUL < 0.5): {results['rul_critical']}")
+    print(f"   Failing (RUL < 0.2): {results['rul_failing']}")
+    
+    print(f"\n📊 INFERENCE TIME (on Raspberry Pi 5):")
+    print(f"   Mean: {results['latency_mean']:.2f} ms")
+    print(f"   Std: {results['latency_std']:.2f} ms")
+    print(f"   Min: {results['latency_min']:.2f} ms")
+    print(f"   Max: {results['latency_max']:.2f} ms")
+    print(f"   95th percentile: {results['latency_p95']:.2f} ms")
+    print(f"   99th percentile: {results['latency_p99']:.2f} ms")
+    
+    print("\n" + "="*70)
+
+# =============================================
+# PLOTTING
+# =============================================
+
+def plot_results(results, dataset_name, output_dir='.'):
+    """Generate research-quality plots."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    if 'confusion_matrix_df' in results and len(results['confusion_matrix_df']) > 0:
+        plt.figure(figsize=(8, 6))
+        cm_df = results['confusion_matrix_df']
+        sns.heatmap(cm_df, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=cm_df.columns, yticklabels=cm_df.index)
+        plt.title(f'{dataset_name} Confusion Matrix (File-Level)')
+        plt.xlabel('Predicted Class')
+        plt.ylabel('True Class')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'{dataset_name}_confusion_matrix.pdf'), dpi=300)
+        plt.close()
+        print(f"✅ Saved: {dataset_name}_confusion_matrix.pdf")
+    
+    if 'per_class' in results and len(results['per_class']) > 0:
+        plt.figure(figsize=(8, 5))
+        per_class = results['per_class']
+        colors = ['green', 'blue', 'orange', 'red', 'purple'][:len(per_class)]
+        bars = plt.bar(per_class['class_name'], per_class['accuracy_percent'], color=colors)
+        plt.ylim(0, 105)
+        plt.ylabel('Accuracy (%)')
+        plt.title(f'{dataset_name} Per-Class Accuracy (File-Level)')
+        for bar, val in zip(bars, per_class['accuracy_percent']):
+            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1, 
+                     f'{val:.1f}%', ha='center', va='bottom')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'{dataset_name}_per_class_accuracy.pdf'), dpi=300)
+        plt.close()
+        print(f"✅ Saved: {dataset_name}_per_class_accuracy.pdf")
+
+# =============================================
+# SAVE RESULTS
+# =============================================
+
+def save_results(results, dataset_name, output_dir='.'):
+    """Save all results to CSV."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    summary_data = {}
+    if 'window_level' in results:
+        summary_data.update({f'window_{k}': v for k, v in results['window_level'].items()})
+    if 'file_level' in results:
+        summary_data.update({f'file_{k}': v for k, v in results['file_level'].items()})
+    
+    if summary_data:
+        pd.DataFrame([summary_data]).to_csv(
+            os.path.join(output_dir, f'{dataset_name}_SUMMARY.csv'), index=False
+        )
+        print(f"✅ Saved: {dataset_name}_SUMMARY.csv")
+    
+    if 'per_class' in results and len(results['per_class']) > 0:
+        results['per_class'].to_csv(
+            os.path.join(output_dir, f'{dataset_name}_PER_CLASS.csv'), index=False
+        )
+        print(f"✅ Saved: {dataset_name}_PER_CLASS.csv")
+    
+    if 'confusion_matrix_df' in results and len(results['confusion_matrix_df']) > 0:
+        results['confusion_matrix_df'].to_csv(
+            os.path.join(output_dir, f'{dataset_name}_CONFUSION_MATRIX.csv')
+        )
+        print(f"✅ Saved: {dataset_name}_CONFUSION_MATRIX.csv")
+    
+    if 'file_df' in results and len(results['file_df']) > 0:
+        results['file_df'].to_csv(
+            os.path.join(output_dir, f'{dataset_name}_FILE_RESULTS.csv'), index=False
+        )
+        print(f"✅ Saved: {dataset_name}_FILE_RESULTS.csv")
+    
+    if 'latency_stats' in results:
+        pd.DataFrame([results['latency_stats']]).to_csv(
+            os.path.join(output_dir, f'{dataset_name}_LATENCY.csv'), index=False
+        )
+        print(f"✅ Saved: {dataset_name}_LATENCY.csv")
+    
+    if 'confidence_stats' in results:
+        conf_data = {f'conf_{k}': v for k, v in results['confidence_stats'].items()}
+        if 'confidence_by_correct' in results:
+            conf_data.update({f'conf_by_{k}': v for k, v in results['confidence_by_correct'].items()})
+        pd.DataFrame([conf_data]).to_csv(
+            os.path.join(output_dir, f'{dataset_name}_CONFIDENCE.csv'), index=False
+        )
+        print(f"✅ Saved: {dataset_name}_CONFIDENCE.csv")
+
+# =============================================
+# MAIN EXECUTION
+# =============================================
+
+if __name__ == "__main__":
+    print("="*70)
+    print("MT-SUPINN DEPLOYMENT RESULTS ANALYZER (RESEARCH GRADE)")
+    print("="*70)
+    
+    output_dir = "/kaggle/working/"
+    
+    # =========================================
+    # 1. CWRU Analysis
+    # =========================================
+    cwru_log_path = "/kaggle/input/datasets/thuraya74/seed256-full-8/8/cwru_predictions.csv"
+    if os.path.exists(cwru_log_path):
+        print("\n📊 Analyzing CWRU results...")
+        df_cwru = load_cwru_predictions(cwru_log_path)
+        if len(df_cwru) > 0:
+            results_cwru = analyze_predictions(df_cwru, CWRU_CLASSES, parse_cwru_ground_truth, "CWRU")
+            print_report(results_cwru, "CWRU")
+            save_results(results_cwru, "CWRU", output_dir)
+            plot_results(results_cwru, "CWRU", output_dir)
+        else:
+            print("⚠️ No CWRU data was successfully parsed")
+    else:
+        print(f"⚠️ CWRU log not found at: {cwru_log_path}")
+    
+    # =========================================
+    # 2. PRONOSTIA Analysis (UPDATED with RMSE/MAE)
+    # =========================================
+    pronostia_log_path = "/kaggle/input/datasets/thuraya74/seed256-full-8/8/pronostia_predictions.csv"
+    pronostia_ground_truth_path = "/kaggle/input/datasets/thuraya74/truth-pro/pronostia_ground_truth.csv"
+    
+    if os.path.exists(pronostia_log_path):
+        print("\n📊 Analyzing PRONOSTIA results...")
+        df_pronostia = load_pronostia_predictions(pronostia_log_path)
+        
+        if len(df_pronostia) > 0:
+            # 1. Basic statistics (what you already have)
+            results_pronostia = analyze_pronostia_results(df_pronostia)
+            print_pronostia_report(results_pronostia)
+            
+            # 2. Save window data
+            df_pronostia.to_csv(os.path.join(output_dir, 'PRONOSTIA_WINDOW_DATA.csv'), index=False)
+            print(f"✅ Saved: PRONOSTIA_WINDOW_DATA.csv")
+            
+            if results_pronostia:
+                pd.DataFrame([results_pronostia]).to_csv(
+                    os.path.join(output_dir, 'PRONOSTIA_SUMMARY.csv'), index=False
+                )
+                print(f"✅ Saved: PRONOSTIA_SUMMARY.csv")
+            
+            # =============================================
+            # NEW: RMSE/MAE calculation with ground truth
+            # =============================================
+            if os.path.exists(pronostia_ground_truth_path):
+                print("\n📊 Calculating Pronostia RMSE/MAE...")
+                # Add this right before the call (~Line 970)
+                print("\n🔍 DEBUG: Checking file lengths...")
+                df_pred_check = pd.read_csv(pronostia_log_path)
+                df_true_check = pd.read_csv(pronostia_ground_truth_path)
+                print(f"   Predictions: {len(df_pred_check)} rows")
+                print(f"   Ground truth: {len(df_true_check)} rows")
+                print(f"   Columns in predictions: {df_pred_check.columns.tolist()}")
+                print(f"   Columns in ground truth: {df_true_check.columns.tolist()}")
+                acc_results, df_merged = analyze_pronostia_with_ground_truth(
+                    pronostia_log_path, 
+                    pronostia_ground_truth_path
+                )
+                
+                if acc_results is not None:
+                    print_pronostia_accuracy_report(acc_results)
+                    plot_pronostia_accuracy(df_merged, output_dir)
+                    
+                    # Save accuracy results
+                    pd.DataFrame([acc_results]).to_csv(
+                        os.path.join(output_dir, 'PRONOSTIA_ACCURACY.csv'), index=False
+                    )
+                    print(f"✅ Saved: PRONOSTIA_ACCURACY.csv")
+                    
+                    # Save merged data with errors
+                    df_merged.to_csv(
+                        os.path.join(output_dir, 'PRONOSTIA_PREDICTIONS_VS_GT.csv'), index=False
+                    )
+                    print(f"✅ Saved: PRONOSTIA_PREDICTIONS_VS_GT.csv")
+            else:
+                print(f"⚠️ Ground truth not found at: {pronostia_ground_truth_path}")
+                print("   Please upload pronostia_ground_truth.csv from Kaggle")
+        else:
+            print("⚠️ No PRONOSTIA data was successfully parsed")
+    else:
+        print(f"⚠️ PRONOSTIA log not found at: {pronostia_log_path}")
+    
+    # =========================================
+    # 3. Paderborn Analysis (FIXED)
+    # =========================================
+    paderborn_log_path = "/kaggle/input/datasets/thuraya74/seed256-full-8/8/paderborn_predictions.csv"
+    if os.path.exists(paderborn_log_path):
+        print("\n📊 Analyzing Paderborn results...")
+        df_paderborn = load_paderborn_predictions(paderborn_log_path)
+        if len(df_paderborn) > 0:
+            results_paderborn = analyze_predictions(df_paderborn, PADERBORN_CLASSES, parse_paderborn_ground_truth, "PADERBORN")
+            print_report(results_paderborn, "PADERBORN")
+            save_results(results_paderborn, "PADERBORN", output_dir)
+            plot_results(results_paderborn, "PADERBORN", output_dir)
+        else:
+            print("⚠️ No Paderborn data was successfully parsed")
+    else:
+        print(f"⚠️ Paderborn log not found at: {paderborn_log_path}")
+    
+    print(f"\n📁 All results saved to: {output_dir}")
+    print("="*70)
