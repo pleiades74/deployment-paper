@@ -1,0 +1,155 @@
+"""
+Pronostia ground-truth generator — FILE-BY-FILE version.
+
+Produces a ground truth that matches the deploy script's output.
+Each (file, start) pair within a bearing gets its own row.
+
+Columns:
+    bearing        - e.g. 'Bearing1_3'
+    file           - basename of the source file, e.g. 'acc_00001.csv'
+    window_start   - window offset WITHIN that file (restarts per file)
+    rul            - ground-truth RUL at that window
+    temporal       - normalized time position
+
+RUL is computed from the BEARING-level position of the window:
+    bearing_time = (file_index * samples_per_file) + window_start
+    rul = (total_life - bearing_time - window_size) / total_life
+"""
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+PRONOSTIA_ROOT = "/kaggle/input/datasets/egorefimow/smallone/Pronostia dataset"
+OUTPUT_CSV     = "pronostia_ground_truth.csv"
+
+WINDOW_SIZE = 1024
+STRIDE      = 1024
+USE_TEST_SET = True
+
+
+# ============================================================
+# LOADER
+# ============================================================
+
+def load_bearing_files(root, use_test_set):
+    if use_test_set:
+        search = os.path.join(root, "Full_Test_Set", "**", "acc_*.csv")
+    else:
+        search = os.path.join(root, "Learning_set", "**", "acc_*.csv")
+
+    files = sorted(glob.glob(search, recursive=True))
+    if not files:
+        raise FileNotFoundError(f"No files under {root}")
+
+    bearings = defaultdict(list)
+    for f in files:
+        parent = os.path.basename(os.path.dirname(f))
+        bearings[parent].append(f)
+
+    for b in bearings:
+        bearings[b] = sorted(bearings[b])
+
+    return bearings
+
+
+def read_signal(path):
+    with open(path, 'r') as fh:
+        first = fh.readline().strip()
+    sep = ';' if ';' in first else ','
+    df = pd.read_csv(path, header=None, delimiter=sep)
+    arr = df.values.astype(np.float32)
+    if arr.shape[1] >= 6:
+        return arr[:, 4], arr[:, 5]
+    elif arr.shape[1] >= 2:
+        return arr[:, 0], arr[:, 1]
+    else:
+        return arr[:, 0], arr[:, 0]
+
+
+# ============================================================
+# GROUND-TRUTH BUILDER — FILE-BY-FILE
+# ============================================================
+
+def build_ground_truth_filewise(bearings, window_size=1024, stride=1024):
+    rows = []
+
+    for bearing_name in sorted(bearings.keys()):
+        files = bearings[bearing_name]
+
+        # First pass: get lengths
+        lengths = []
+        for fp in files:
+            try:
+                h, _ = read_signal(fp)
+                lengths.append(len(h))
+            except Exception:
+                lengths.append(0)
+
+        # Total bearing life = sum of file lengths
+        total_life = sum(lengths)
+        print(f"  {bearing_name}: {len(files)} files, "
+              f"total life = {total_life} samples")
+
+        # Second pass: generate windows per file
+        file_offset = 0  # running bearing-level offset
+        for fp, L in zip(files, lengths):
+            if L < window_size:
+                file_offset += L
+                continue
+
+            n_windows = (L - window_size) // stride + 1
+            fname = os.path.basename(fp)
+
+            for i in range(n_windows):
+                wstart = i * stride                      # within-file start
+                bearing_time = file_offset + wstart       # bearing-level time
+
+                rul = max(0.0, min(1.0,
+                          (total_life - bearing_time - window_size) / total_life))
+                temporal = (bearing_time + window_size) / total_life
+
+                rows.append({
+                    'bearing':       bearing_name,
+                    'file':          fname,
+                    'window_start':  wstart,
+                    'rul':           float(rul),
+                    'temporal':      float(temporal),
+                })
+
+            file_offset += L
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    print("="*70)
+    print("PRONOSTIA GROUND-TRUTH REGEN (FILE-BY-FILE)")
+    print("="*70)
+
+    bearings = load_bearing_files(PRONOSTIA_ROOT, USE_TEST_SET)
+    print(f"\n   Found {len(bearings)} bearings")
+
+    df = build_ground_truth_filewise(bearings, WINDOW_SIZE, STRIDE)
+
+    print(f"\n✅ Total rows: {len(df)}")
+    print(f"   RUL range: {df['rul'].min():.4f} to {df['rul'].max():.4f}")
+
+    print(f"\n📊 Per-bearing row counts:")
+    for b, g in df.groupby('bearing'):
+        print(f"   {b}: {len(g)} rows, "
+              f"{g['file'].nunique()} unique files")
+
+    df.to_csv(OUTPUT_CSV, index=False)
+    print(f"\n✅ Saved: {OUTPUT_CSV}")
+    print(f"   Columns: {df.columns.tolist()}")
