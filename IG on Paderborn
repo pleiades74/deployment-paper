@@ -1,0 +1,109 @@
+# ============================================================
+# K2 REDO: IG on Paderborn (using the training loader)
+# ============================================================
+import os
+import numpy as np
+import tensorflow as tf
+import json
+import matplotlib.pyplot as plt
+
+# --- Load Paderborn windows via the training loader ---
+pader_loader = PaderbornMultimodalLoader(PADER_DIR, config)
+X_p_test, X_p_ews, y_p_class, y_p_sev, p_files, _ = pader_loader.load_balanced_subset(total_files=30)
+
+# Scale EWS with the training scaler (same as main pipeline)
+X_p_ews_scaled = scaler.transform(X_p_ews)
+
+print(f"Paderborn test windows: {X_p_test.shape}, EWS: {X_p_ews_scaled.shape}")
+print(f"Temperature: mean={X_p_test[:,:,3].mean():.2f}, std={X_p_test[:,:,3].std():.2f}")
+print(f"Current-1:   mean={X_p_test[:,:,1].mean():.4f}, std={X_p_test[:,:,1].std():.4f}")
+print(f"Current-2:   mean={X_p_test[:,:,2].mean():.4f}, std={X_p_test[:,:,2].std():.4f}")
+
+# ---- IG computation ----
+def integrated_gradients(model, vib, ews, baseline_vib, baseline_ews, score_fn, steps=8):
+    alphas = np.linspace(0, 1, steps + 1)[1:]
+    ig_vib = np.zeros_like(vib, dtype=np.float32)
+    ig_ews = np.zeros_like(ews, dtype=np.float32)
+    for a in alphas:
+        iv = baseline_vib + a * (vib - baseline_vib)
+        ie = baseline_ews + a * (ews - baseline_ews)
+        with tf.GradientTape() as tape:
+            v = tf.convert_to_tensor(iv, tf.float32)
+            e = tf.convert_to_tensor(ie, tf.float32)
+            tape.watch([v, e])
+            score = score_fn(v, e)
+        gv, ge = tape.gradient(score, [v, e])
+        ig_vib += gv.numpy()
+        ig_ews += ge.numpy()
+    ig_vib /= steps
+    ig_ews /= steps
+    ig_vib *= (vib - baseline_vib)
+    ig_ews *= (ews - baseline_ews)
+    return ig_vib, ig_ews
+
+N_BG, N_EXPLAIN, STEPS = 80, 15, 8
+baseline_vib = np.mean(X_p_test[:N_BG], axis=0, keepdims=True)
+baseline_ews = np.mean(X_p_ews_scaled[:N_BG], axis=0, keepdims=True)
+explain_vib = X_p_test[N_BG:N_BG+N_EXPLAIN].astype(np.float32)
+explain_ews = X_p_ews_scaled[N_BG:N_BG+N_EXPLAIN].astype(np.float32)
+
+@tf.function(reduce_retracing=True)
+def pader_score(v, e):
+    p = model([v, e], training=False)
+    return tf.reduce_max(p['paderborn_class'], axis=-1)
+
+all_v, all_e = [], []
+for i in range(N_EXPLAIN):
+    gv, ge = integrated_gradients(model, explain_vib[i:i+1], explain_ews[i:i+1],
+                                   baseline_vib, baseline_ews, pader_score, STEPS)
+    all_v.append(gv); all_e.append(ge)
+
+ig_vib = np.vstack(all_v)
+ig_ews = np.vstack(all_e)
+
+# Report
+ews_names = ['RMS','Peak','Crest','Std','Skew','Kurt','P2P','Shape','Impulse','Clearance','Autocorr']
+channel_names = ['Vibration','Current-1','Current-2','Temperature']
+ews_imp = np.mean(np.abs(ig_ews), axis=(0,1)) if ig_ews.ndim == 3 else np.mean(np.abs(ig_ews), axis=0)
+vib_imp = np.mean(np.abs(ig_vib), axis=(0,1))
+
+print("\n📊 Paderborn EWS importance (top-5):")
+for i in np.argsort(ews_imp)[::-1][:5]:
+    print(f"   {ews_names[i]:12s}: {ews_imp[i]:.6f}")
+
+print("\n📊 Paderborn channel importance:")
+for i in np.argsort(vib_imp)[::-1]:
+    print(f"   {channel_names[i]:12s}: {vib_imp[i]:.6f}")
+
+# Save figures
+out_dir = "/kaggle/working/ig_paderborn"
+os.makedirs(out_dir, exist_ok=True)
+
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.bar(range(11), ews_imp, color='steelblue', edgecolor='black')
+ax.set_xticks(range(11))
+ax.set_xticklabels(ews_names, rotation=45, ha='right')
+ax.set_ylabel('Mean |IG|', fontweight='bold')
+ax.set_title('EWS importance (Paderborn)', fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(out_dir, 'ig_ews_importance.png'), dpi=300)
+plt.savefig(os.path.join(out_dir, 'ig_ews_importance.pdf'))
+plt.close()
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.bar(channel_names, vib_imp, color='darkorange', edgecolor='black')
+ax.set_ylabel('Mean |IG|', fontweight='bold')
+ax.set_title('Channel importance (Paderborn)', fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(out_dir, 'ig_channel_importance.png'), dpi=300)
+plt.savefig(os.path.join(out_dir, 'ig_channel_importance.pdf'))
+plt.close()
+
+with open(os.path.join(out_dir, 'ig_summary.json'), 'w') as f:
+    json.dump({
+        'ews_importance': {n: float(v) for n, v in zip(ews_names, ews_imp)},
+        'channel_importance': {n: float(v) for n, v in zip(channel_names, vib_imp)},
+        'n_explained': N_EXPLAIN,
+        'n_background': N_BG,
+    }, f, indent=2)
+print(f"\n✅ Saved to {out_dir}")
